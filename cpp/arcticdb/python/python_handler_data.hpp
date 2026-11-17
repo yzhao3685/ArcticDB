@@ -2,8 +2,12 @@
 
 #include <pybind11/pybind11.h>
 #include <arcticdb/pipeline/output_config.hpp>
+#include <arcticdb/util/preconditions.hpp>
+#include <arcticdb/util/type_handler.hpp>
 
+#include <any>
 #include <atomic>
+#include <limits>
 #include <memory>
 
 // Python 3.12 (PEP 683) made Py_None immortal: Py_INCREF on it is a no-op, so we no longer
@@ -22,12 +26,8 @@ inline py::handle* create_py_nan() {
 }
 
 struct PythonHandlerData {
-    PythonHandlerData() :
-        py_nan_(std::shared_ptr<py::handle>(create_py_nan(), [](py::handle* py_obj) {
-            PyGILState_STATE gstate = PyGILState_Ensure();
-            delete py_obj; // Calls ~handle(), which does dec_ref() with GIL held
-            PyGILState_Release(gstate);
-        })) {}
+    // Default deleter: ~handle() doesn't dec_ref, and taking the GIL on a worker during finalization kills the thread
+    PythonHandlerData() : py_nan_(create_py_nan()) {}
 
     void increment_missing_refcount(PandasMissingValue value, size_t increment) {
         if (value == PandasMissingValue::NaN) {

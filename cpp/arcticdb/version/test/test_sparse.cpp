@@ -9,6 +9,9 @@
 #include "util/constants.hpp"
 #include <gtest/gtest.h>
 
+#include <future>
+#include <optional>
+
 #include <arcticdb/stream/index.hpp>
 #include <arcticdb/stream/schema.hpp>
 #include <arcticdb/stream/aggregator.hpp>
@@ -109,6 +112,21 @@ TEST(PythonHandlerData, GetMissingValue) {
     PythonHandlerData handler_data;
     EXPECT_EQ(handler_data.get_missing_value(PandasMissingValue::None), Py_None);
     EXPECT_EQ(handler_data.get_missing_value(PandasMissingValue::NaN), handler_data.non_owning_nan_handle());
+}
+
+TEST(PythonHandlerData, DestructionDoesNotWaitForGil) {
+    using namespace arcticdb;
+    ScopedGILLock gil;
+    std::optional<PythonHandlerData> handler_data{std::in_place};
+    // Workers drop the last copy while this thread holds the GIL, e.g. while the interpreter is finalizing
+    auto destroyed = std::async(std::launch::async, [&handler_data] { handler_data.reset(); });
+    const bool destroyed_without_waiting = destroyed.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    {
+        // Unblock the worker if it is waiting for the GIL
+        py::gil_scoped_release release;
+        destroyed.wait();
+    }
+    EXPECT_TRUE(destroyed_without_waiting);
 }
 
 TEST(PythonStringHandler, DefaultInitializeRespectsStringType) {
