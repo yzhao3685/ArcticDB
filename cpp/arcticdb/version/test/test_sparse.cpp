@@ -9,7 +9,6 @@
 #include "util/constants.hpp"
 #include <gtest/gtest.h>
 
-#include <future>
 #include <optional>
 
 #include <arcticdb/stream/index.hpp>
@@ -74,7 +73,8 @@ TEST(PythonEmptyHandler, ConvertTypeRespectsDestinationType) {
         dest.allocate_and_advance_by(sizeof(PyObject*));
         ReadOptions options;
         options.set_output_config(PandasOutputConfig{format});
-        std::any handler_data{PythonHandlerData{}};
+        PythonReadHandlerData read_data{OutputFormat::PANDAS};
+        auto& handler_data = read_data.get();
 
         PythonEmptyHandler{}.convert_type(
                 source, dest, mapping, DecodePathData{}, handler_data, std::make_shared<StringPool>(), options
@@ -98,35 +98,13 @@ TEST(PythonEmptyHandler, DefaultInitializeKeepsEmptyAsNone) {
 
     ReadOptions options;
     options.set_output_config(PandasOutputConfig{PandasStringFormat::OBJECT_WITH_NANS_ONLY});
-    std::any handler_data{PythonHandlerData{}};
+    PythonReadHandlerData read_data{OutputFormat::PANDAS};
+    auto& handler_data = read_data.get();
     ChunkedBuffer buffer = ChunkedBuffer::presized(sizeof(PyObject*));
 
     PythonEmptyHandler{}.default_initialize(buffer, 0, sizeof(PyObject*), DecodePathData{}, handler_data, options);
 
     EXPECT_EQ(*buffer.ptr_cast<PyObject*>(0, sizeof(PyObject*)), Py_None);
-}
-
-TEST(PythonHandlerData, GetMissingValue) {
-    using namespace arcticdb;
-
-    PythonHandlerData handler_data;
-    EXPECT_EQ(handler_data.get_missing_value(PandasMissingValue::None), Py_None);
-    EXPECT_EQ(handler_data.get_missing_value(PandasMissingValue::NaN), handler_data.non_owning_nan_handle());
-}
-
-TEST(PythonHandlerData, DestructionDoesNotWaitForGil) {
-    using namespace arcticdb;
-    ScopedGILLock gil;
-    std::optional<PythonHandlerData> handler_data{std::in_place};
-    // Workers drop the last copy while this thread holds the GIL, e.g. while the interpreter is finalizing
-    auto destroyed = std::async(std::launch::async, [&handler_data] { handler_data.reset(); });
-    const bool destroyed_without_waiting = destroyed.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    {
-        // Unblock the worker if it is waiting for the GIL
-        py::gil_scoped_release release;
-        destroyed.wait();
-    }
-    EXPECT_TRUE(destroyed_without_waiting);
 }
 
 TEST(PythonStringHandler, DefaultInitializeRespectsStringType) {
@@ -140,7 +118,8 @@ TEST(PythonStringHandler, DefaultInitializeRespectsStringType) {
 
         ReadOptions options;
         options.set_output_config(PandasOutputConfig{format});
-        std::any handler_data{PythonHandlerData{}};
+        PythonReadHandlerData read_data{OutputFormat::PANDAS};
+        auto& handler_data = read_data.get();
         ChunkedBuffer buffer = ChunkedBuffer::presized(sizeof(PyObject*));
         handler->default_initialize(buffer, 0, sizeof(PyObject*), DecodePathData{}, handler_data, options);
 
@@ -168,7 +147,8 @@ TEST(PythonStringHandler, PresentNullRespectsStringFormatAndEncoding) {
         );
         Column source(descriptor);
         source.set_scalar(0, string_none);
-        PythonHandlerData handler_data;
+        PythonReadHandlerData read_data{OutputFormat::PANDAS};
+        auto& handler_data = std::any_cast<PythonHandlerData&>(read_data.get());
         PyObject* output = nullptr;
 
         ReadOptions options;
@@ -411,7 +391,6 @@ TEST_F(SparseTestStore, SimpleRoundtripStrings) {
     using namespace arcticdb::stream;
     std::optional<ScopedGILLock> scoped_gil_lock;
     register_python_string_types();
-    register_python_handler_data_factory();
     using DynamicAggregator =
             Aggregator<TimeseriesIndex, DynamicSchema, stream::NeverSegmentPolicy, stream::SparseColumnPolicy>;
     using DynamicSinkWrapper = SinkWrapperImpl<DynamicAggregator>;
@@ -439,8 +418,8 @@ TEST_F(SparseTestStore, SimpleRoundtripStrings) {
     read_options.set_incompletes(true);
     auto read_query = std::make_shared<ReadQuery>();
     read_query->row_filter = universal_range();
-    auto handler_data =
-            std::make_shared<std::any>(TypeHandlerRegistry::instance()->get_handler_data(OutputFormat::PANDAS));
+    PythonReadHandlerData read_data{OutputFormat::PANDAS};
+    auto handler_data = read_data.take_shared_data();
     auto read_result = test_store_->read_dataframe_version(
             stream_id, pipelines::VersionQuery{}, read_query, read_options, handler_data
     );
@@ -849,7 +828,6 @@ TEST_F(SparseTestStore, CompactWithStrings) {
             Aggregator<TimeseriesIndex, DynamicSchema, stream::RowCountSegmentPolicy, stream::SparseColumnPolicy>;
 
     register_python_string_types();
-    register_python_handler_data_factory();
     const std::string stream_id("test_sparse");
 
     const auto index = TimeseriesIndex::default_index();
@@ -886,8 +864,8 @@ TEST_F(SparseTestStore, CompactWithStrings) {
     read_options.set_dynamic_schema(true);
     auto read_query = std::make_shared<ReadQuery>();
     read_query->row_filter = universal_range();
-    auto handler_data =
-            std::make_shared<std::any>(TypeHandlerRegistry::instance()->get_handler_data(OutputFormat::PANDAS));
+    PythonReadHandlerData read_data{OutputFormat::PANDAS};
+    auto handler_data = read_data.take_shared_data();
     auto read_result =
             test_store_->read_dataframe_version(stream_id, VersionQuery{}, read_query, read_options, handler_data);
     apply_global_refcounts(*handler_data, OutputFormat::PANDAS);

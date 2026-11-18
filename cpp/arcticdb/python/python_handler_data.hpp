@@ -3,12 +3,14 @@
 #include <pybind11/pybind11.h>
 #include <arcticdb/pipeline/output_config.hpp>
 #include <arcticdb/util/preconditions.hpp>
+#include <arcticdb/util/preprocess.hpp>
 #include <arcticdb/util/type_handler.hpp>
 
 #include <any>
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <utility>
 
 // Python 3.12 (PEP 683) made Py_None immortal: Py_INCREF on it is a no-op, so we no longer
 // need to track how many times it was used and replay the INCREFs at end-of-read.
@@ -18,16 +20,15 @@ namespace arcticdb {
 
 namespace py = pybind11;
 
-inline py::handle* create_py_nan() {
+inline PyObject* create_py_nan() {
     util::check(PyGILState_Check() != 0, "Expected GIL to be held when allocating Python nan");
     auto ptr = PyFloat_FromDouble(std::numeric_limits<double>::quiet_NaN());
     util::check(ptr != nullptr, "Got null nan ptr");
-    return new py::handle(ptr);
+    return ptr;
 }
 
 struct PythonHandlerData {
-    // Default deleter: ~handle() doesn't dec_ref, and taking the GIL on a worker during finalization kills the thread
-    PythonHandlerData() : py_nan_(create_py_nan()) {}
+    explicit PythonHandlerData(PyObject* nan) : py_nan_(nan) {}
 
     void increment_missing_refcount(PandasMissingValue value, size_t increment) {
         if (value == PandasMissingValue::NaN) {
@@ -43,7 +44,7 @@ struct PythonHandlerData {
 
     bool is_nan_initialized() const { return static_cast<bool>(py_nan_); }
 
-    PyObject* non_owning_nan_handle() const { return py_nan_->ptr(); }
+    PyObject* non_owning_nan_handle() const { return py_nan_; }
 
     PyObject* get_missing_value(PandasMissingValue value) const {
         return value == PandasMissingValue::NaN ? non_owning_nan_handle() : Py_None;
@@ -63,19 +64,19 @@ struct PythonHandlerData {
 #endif
     }
 
-    /// There is no need to hold the GIL for this operation as this python object was created by the
-    /// PythonHandlerData object on a read/read_batch/etc... operation and not handled to python yet.
+    /// The read scope owns this NaN exclusively until the output is handed to Python.
     void apply_nan_refcount() {
         const size_t count = nan_refcount_->exchange(0, std::memory_order_acq_rel);
         if (count > 0) {
-            Py_SET_REFCNT(py_nan_->ptr(), count);
+            // Include the initial reference held by the read scope.
+            Py_SET_REFCNT(py_nan_, count + 1);
         }
     }
 
   private:
     std::shared_ptr<std::atomic<uint64_t>> none_refcount_ = std::make_shared<std::atomic<uint64_t>>(0);
     std::shared_ptr<std::atomic<uint64_t>> nan_refcount_ = std::make_shared<std::atomic<uint64_t>>(0);
-    std::shared_ptr<py::handle> py_nan_;
+    PyObject* py_nan_;
 };
 
 inline void apply_global_refcounts(std::any& handler_data, OutputFormat output_format) {
@@ -86,8 +87,58 @@ inline void apply_global_refcounts(std::any& handler_data, OutputFormat output_f
     }
 }
 
-struct PythonHandlerDataFactory : public TypeHandlerDataFactory {
-    std::any get_data() const override { return {PythonHandlerData{}}; }
+// Keep the owning reference on the caller's GIL-held stack while worker data borrows it.
+class ARCTICDB_VISIBILITY_HIDDEN PythonReadHandlerData {
+  public:
+    explicit PythonReadHandlerData(OutputFormat format) :
+        nan_(format == OutputFormat::PANDAS ? py::reinterpret_steal<py::object>(create_py_nan()) : py::object{}),
+        data_(nan_ ? std::any(std::in_place_type<PythonHandlerData>, nan_.ptr())
+                   : TypeHandlerRegistry::instance()->get_handler_data(format)) {}
+
+    ~PythonReadHandlerData() {
+        // A failed read can return before sibling decode tasks have finished.
+        if (workers_done_ && !workers_done_->load(std::memory_order_acquire)) {
+            auto* thread_state = PyEval_SaveThread();
+            workers_done_->wait(false, std::memory_order_acquire);
+            PyEval_RestoreThread(thread_state);
+        }
+    }
+
+    PythonReadHandlerData(const PythonReadHandlerData&) = delete;
+    PythonReadHandlerData& operator=(const PythonReadHandlerData&) = delete;
+
+    std::any& get() { return data_; }
+
+    std::shared_ptr<std::any> take_shared_data() {
+        if (!nan_) {
+            return std::make_shared<std::any>(std::move(data_));
+        }
+
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto shared = std::make_shared<SharedData>(std::move(data_), done);
+        workers_done_ = std::move(done);
+        auto* data = &shared->data;
+        return {std::move(shared), data};
+    }
+
+  private:
+    struct SharedData {
+        SharedData(std::any&& handler_data, const std::shared_ptr<std::atomic<bool>>& complete) :
+            data(std::move(handler_data)),
+            done(complete) {}
+
+        ~SharedData() {
+            done->store(true, std::memory_order_release);
+            done->notify_one();
+        }
+
+        std::any data;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    py::object nan_;
+    std::any data_;
+    std::shared_ptr<std::atomic<bool>> workers_done_;
 };
 
 } // namespace arcticdb

@@ -21,6 +21,7 @@
 #include <arcticdb/stream/incompletes.hpp>
 #include <arcticdb/entity/protobuf_mappings.hpp>
 #include <arcticdb/python/adapt_read_dataframe.hpp>
+#include <arcticdb/python/python_handler_data.hpp>
 #include <arcticdb/util/storage_lock.hpp>
 #include <cstdlib>
 
@@ -36,7 +37,8 @@ async::AsyncStore<>& LibraryTool::async_store() { return dynamic_cast<async::Asy
 
 py::tuple LibraryTool::segment_in_memory_to_read_result(SegmentInMemory& segment) {
     constexpr OutputFormat output_format = OutputFormat::PANDAS;
-    auto handler_data = TypeHandlerRegistry::instance()->get_handler_data(output_format);
+    PythonReadHandlerData read_data{output_format};
+    auto& handler_data = read_data.get();
 
     // This is a dummy atom key needed to construct the read result, otherwise not important
     const auto& atom_key = AtomKeyBuilder().build<KeyType::VERSION_REF>(segment.descriptor().id());

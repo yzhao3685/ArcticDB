@@ -27,6 +27,7 @@
 #include <arcticdb/processing/query_planner.hpp>
 #include <arcticdb/pipeline/value_set.hpp>
 #include <arcticdb/python/adapt_read_dataframe.hpp>
+#include <arcticdb/python/python_handler_data.hpp>
 #include <arcticdb/python/numpy_buffer_holder.hpp>
 #include <arcticdb/version/schema_checks.hpp>
 #include <arcticdb/util/pybind_mutex.hpp>
@@ -284,9 +285,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
             "read_dataframe_from_file",
             [](StreamId sid, std::string path, std::shared_ptr<ReadQuery>& read_query, const ReadOptions& read_options
             ) {
-                auto handler_data = std::make_shared<std::any>(
-                        TypeHandlerRegistry::instance()->get_handler_data(read_options.output_format_for_frame())
-                );
+                PythonReadHandlerData read_data{read_options.output_format_for_frame()};
+                auto handler_data = read_data.take_shared_data();
                 return adapt_read_df(
                         read_dataframe_from_file(sid, path, read_query, read_options, handler_data), handler_data.get()
                 );
@@ -746,7 +746,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
             .def(
                     "read_column_stats_version",
                     [&](PythonVersionStore& v, StreamId sid, const VersionQuery& version_query) {
-                        auto handler_data = TypeHandlerRegistry::instance()->get_handler_data(OutputFormat::PANDAS);
+                        PythonReadHandlerData read_data{OutputFormat::PANDAS};
+                        auto& handler_data = read_data.get();
                         return adapt_read_df(
                                 v.read_column_stats_version(sid, version_query, handler_data), &handler_data
                         );
@@ -913,10 +914,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
                         const VersionQuery& version_query,
                         const std::shared_ptr<ReadQuery>& read_query,
                         const ReadOptions& read_options) {
-                        auto handler_data =
-                                std::make_shared<std::any>(TypeHandlerRegistry::instance()->get_handler_data(
-                                        read_options.output_format_for_frame()
-                                ));
+                        PythonReadHandlerData read_data{read_options.output_format_for_frame()};
+                        auto handler_data = read_data.take_shared_data();
                         return adapt_read_df(
                                 v.read_dataframe_version(sid, version_query, read_query, read_options, handler_data),
                                 handler_data.get()
@@ -933,7 +932,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
                     "read_index",
                     [&](PythonVersionStore& v, StreamId sid, const VersionQuery& version_query) {
                         constexpr OutputFormat output_format = OutputFormat::PANDAS;
-                        auto handler_data = TypeHandlerRegistry::instance()->get_handler_data(output_format);
+                        PythonReadHandlerData read_data{output_format};
+                        auto& handler_data = read_data.get();
                         return adapt_read_df(
                                 v.read_index(sid, version_query, output_format, handler_data), &handler_data
                         );
@@ -1065,9 +1065,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
                         const std::vector<VersionQuery>& version_queries,
                         std::vector<std::shared_ptr<ReadQuery>>& read_queries,
                         const BatchReadOptions& batch_read_options) {
-                        auto handler_data = std::make_shared<std::any>(
-                                TypeHandlerRegistry::instance()->get_handler_data(batch_read_options.output_format())
-                        );
+                        PythonReadHandlerData read_data{batch_read_options.output_format()};
+                        auto handler_data = read_data.take_shared_data();
                         return python_util::adapt_read_dfs(
                                 v.batch_read(
                                         stream_ids, version_queries, read_queries, batch_read_options, handler_data
@@ -1113,9 +1112,8 @@ void register_bindings(py::module& version, py::exception<arcticdb::ArcticExcept
                             });
                         }
                         const OutputFormat output_format = read_options.output_format_for_frame();
-                        auto handler_data = std::make_shared<std::any>(
-                                TypeHandlerRegistry::instance()->get_handler_data(output_format)
-                        );
+                        PythonReadHandlerData read_data{output_format};
+                        auto handler_data = read_data.take_shared_data();
                         return adapt_read_df(
                                 v.batch_read_and_join(
                                         std::make_shared<std::vector<StreamId>>(std::move(stream_ids)),

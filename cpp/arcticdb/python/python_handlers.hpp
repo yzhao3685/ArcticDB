@@ -150,9 +150,4 @@ inline void register_python_string_types() {
     }
 }
 
-inline void register_python_handler_data_factory() {
-    TypeHandlerRegistry::instance()->set_handler_data(
-            OutputFormat::PANDAS, std::make_unique<PythonHandlerDataFactory>()
-    );
-}
 } // namespace arcticdb

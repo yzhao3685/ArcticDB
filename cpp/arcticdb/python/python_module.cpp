@@ -312,7 +312,6 @@ PYBIND11_MODULE(arcticdb_ext, m) {
     pthread_atfork(nullptr, nullptr, &SingleThreadMutexHolder::reset_mutex);
     pthread_atfork(nullptr, nullptr, &reinit_scheduler);
     pthread_atfork(nullptr, nullptr, &reinit_lmdb_warning);
-    pthread_atfork(nullptr, nullptr, &register_python_handler_data_factory);
 #endif
     register_fork_warning();
     // Set up the global exception handlers first, so module-specific exception handler can override it:
