@@ -8,6 +8,7 @@
 
 #include <any>
 #include <atomic>
+#include <forward_list>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -87,20 +88,24 @@ inline void apply_global_refcounts(std::any& handler_data, OutputFormat output_f
     }
 }
 
-// Keep the owning reference on the caller's GIL-held stack while worker data borrows it.
+// Workers borrow the NaN. Its owning reference stays on the GIL-held read or cleanup path.
 class ARCTICDB_VISIBILITY_HIDDEN PythonReadHandlerData {
   public:
     explicit PythonReadHandlerData(OutputFormat format) :
         nan_(format == OutputFormat::PANDAS ? py::reinterpret_steal<py::object>(create_py_nan()) : py::object{}),
         data_(nan_ ? std::any(std::in_place_type<PythonHandlerData>, nan_.ptr())
-                   : TypeHandlerRegistry::instance()->get_handler_data(format)) {}
+                   : TypeHandlerRegistry::instance()->get_handler_data(format)),
+        deferred_(nan_ ? &deferred_nans() : nullptr) {
+        if (deferred_) {
+            deferred_->reclaim();
+        }
+    }
 
     ~PythonReadHandlerData() {
-        // A failed read can return before sibling decode tasks have finished.
-        if (workers_done_ && !workers_done_->load(std::memory_order_acquire)) {
-            auto* thread_state = PyEval_SaveThread();
-            workers_done_->wait(false, std::memory_order_acquire);
-            PyEval_RestoreThread(thread_state);
+        if (!pending_.empty() && !pending_.front().is_complete()) {
+            // An early error can leave workers decoding with the borrowed pointer.
+            pending_.front().nan = nan_.release().ptr();
+            deferred_->entries.splice_after(deferred_->entries.before_begin(), pending_);
         }
     }
 
@@ -110,13 +115,13 @@ class ARCTICDB_VISIBILITY_HIDDEN PythonReadHandlerData {
     std::any& get() { return data_; }
 
     std::shared_ptr<std::any> take_shared_data() {
-        if (!nan_) {
+        if (!deferred_) {
             return std::make_shared<std::any>(std::move(data_));
         }
-
+        util::check(pending_.empty(), "Pandas handler data has already been transferred to workers");
         auto done = std::make_shared<std::atomic<bool>>(false);
         auto shared = std::make_shared<SharedData>(std::move(data_), done);
-        workers_done_ = std::move(done);
+        pending_.emplace_front(DeferredNan{std::move(done), nullptr});
         auto* data = &shared->data;
         return {std::move(shared), data};
     }
@@ -127,18 +132,66 @@ class ARCTICDB_VISIBILITY_HIDDEN PythonReadHandlerData {
             data(std::move(handler_data)),
             done(complete) {}
 
-        ~SharedData() {
-            done->store(true, std::memory_order_release);
-            done->notify_one();
-        }
+        // Publish the workers' final access before the read or deferred cleanup releases the NaN.
+        ~SharedData() { done->store(true, std::memory_order_release); }
 
         std::any data;
         std::shared_ptr<std::atomic<bool>> done;
     };
 
+    struct DeferredNan {
+        std::shared_ptr<std::atomic<bool>> done;
+        PyObject* nan;
+
+        bool is_complete() const { return done->load(std::memory_order_acquire); }
+    };
+
+    struct DeferredNans {
+        std::forward_list<DeferredNan> entries;
+
+        void reclaim() {
+            entries.remove_if([](const DeferredNan& read) {
+                if (!read.is_complete()) {
+                    return false;
+                }
+                Py_DECREF(read.nan);
+                return true;
+            });
+        }
+
+        // Leave references still borrowed at interpreter teardown alive for the workers.
+        ~DeferredNans() { reclaim(); }
+    };
+
+    static DeferredNans& deferred_nans() {
+        constexpr auto key = "arcticdb.deferred_pandas_nans";
+        auto* dict = PyInterpreterState_GetDict(PyInterpreterState_Get());
+        util::check(dict != nullptr, "Could not get Python interpreter state dictionary");
+        const py::str dict_key(key);
+        if (auto* entry = PyDict_GetItemWithError(dict, dict_key.ptr())) {
+            auto* queue = static_cast<DeferredNans*>(PyCapsule_GetPointer(entry, key));
+            if (!queue) {
+                throw py::error_already_set();
+            }
+            return *queue;
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+
+        auto queue = std::make_unique<DeferredNans>();
+        py::capsule capsule(queue.get(), key, [](void* data) { delete static_cast<DeferredNans*>(data); });
+        auto& result = *queue.release();
+        if (PyDict_SetItem(dict, dict_key.ptr(), capsule.ptr()) != 0) {
+            throw py::error_already_set();
+        }
+        return result;
+    }
+
     py::object nan_;
     std::any data_;
-    std::shared_ptr<std::atomic<bool>> workers_done_;
+    DeferredNans* deferred_;
+    std::forward_list<DeferredNan> pending_;
 };
 
 } // namespace arcticdb

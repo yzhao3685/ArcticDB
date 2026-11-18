@@ -12,6 +12,8 @@
 
 #include <any>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <future>
 
 TEST(PythonHandlerData, GetMissingValue) {
@@ -75,29 +77,100 @@ TEST(PythonHandlerData, ReadScopeReleasesOnlyItsOwnNanReference) {
     EXPECT_EQ(Py_REFCNT(first_slot.ptr()), 2);
 }
 
-TEST(PythonHandlerData, ReadScopeKeepsNanAliveUntilWorkersFinish) {
+namespace {
+
+constexpr auto deferred_nans_key = "arcticdb.deferred_pandas_nans";
+
+enum class NanCleanup : uint8_t { NextRead, InterpreterTeardown, InterpreterTeardownWithWorker };
+
+class DeferredNanCleanupTest : public testing::TestWithParam<NanCleanup> {};
+
+TEST_P(DeferredNanCleanupTest, ReadScopeReturnsBeforeWorkerAndReleasesNanLater) {
     using namespace arcticdb;
     ScopedGILLock gil;
     py::object probe;
-    std::future<Py_ssize_t> worker;
+    std::promise<void> allow_worker_to_finish;
+    std::future<bool> worker;
     {
         PythonReadHandlerData read_data{OutputFormat::PANDAS};
         auto& handler_data = std::any_cast<PythonHandlerData&>(read_data.get());
         probe = py::reinterpret_borrow<py::object>(handler_data.non_owning_nan_handle());
-        worker = std::async(std::launch::async, [data = read_data.take_shared_data()]() mutable {
-            ScopedGILLock worker_gil;
-            const auto& handler = std::any_cast<const PythonHandlerData&>(*data);
-            const auto count = Py_REFCNT(handler.non_owning_nan_handle());
-            data.reset();
-            return count;
-        });
+        worker = std::async(
+                std::launch::async,
+                [data = read_data.take_shared_data(), ready = allow_worker_to_finish.get_future()]() mutable {
+                    const bool read_returned = ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+                    data.reset();
+                    return read_returned;
+                }
+        );
     }
 
-    Py_ssize_t worker_count;
-    {
-        py::gil_scoped_release release;
-        worker_count = worker.get();
+    EXPECT_EQ(Py_REFCNT(probe.ptr()), 2);
+    auto* state = PyInterpreterState_GetDict(PyInterpreterState_Get());
+    const auto cleanup = GetParam();
+    if (cleanup == NanCleanup::InterpreterTeardownWithWorker) {
+        EXPECT_EQ(PyDict_DelItemString(state, deferred_nans_key), 0);
+        EXPECT_EQ(Py_REFCNT(probe.ptr()), 2);
     }
-    EXPECT_EQ(worker_count, 2);
+    allow_worker_to_finish.set_value();
+    EXPECT_TRUE(worker.get());
+    EXPECT_EQ(Py_REFCNT(probe.ptr()), 2);
+
+    if (cleanup == NanCleanup::NextRead) {
+        PythonReadHandlerData next_read{OutputFormat::PANDAS};
+    } else if (cleanup == NanCleanup::InterpreterTeardown) {
+        // Release the capsule just as interpreter teardown does.
+        ASSERT_EQ(PyDict_DelItemString(state, deferred_nans_key), 0);
+    } else {
+        // This test is still in a live interpreter after simulating teardown.
+        ASSERT_EQ(Py_REFCNT(probe.ptr()), 2);
+        Py_DECREF(probe.ptr());
+    }
     EXPECT_EQ(Py_REFCNT(probe.ptr()), 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+        PythonHandlerData, DeferredNanCleanupTest,
+        testing::Values(
+                NanCleanup::NextRead, NanCleanup::InterpreterTeardown, NanCleanup::InterpreterTeardownWithWorker
+        )
+);
+
+} // namespace
+
+TEST(PythonHandlerDataDeathTest, DeferredNanCleanupUsesTheCurrentInterpreter) {
+    using namespace arcticdb;
+    // Creating a subinterpreter changes PyGILState_Check behavior in the process.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+            {
+                ScopedGILLock gil;
+                PythonReadHandlerData main_read{OutputFormat::PANDAS};
+                auto* main_thread = PyThreadState_Get();
+                auto* main_state = PyInterpreterState_GetDict(PyInterpreterState_Get());
+                auto* main_queue = PyDict_GetItemString(main_state, deferred_nans_key);
+
+                auto* subinterpreter = Py_NewInterpreter();
+                if (!subinterpreter || !main_queue) {
+                    std::_Exit(EXIT_FAILURE);
+                }
+                bool isolated;
+                std::shared_ptr<std::any> child_borrower;
+                {
+                    PythonReadHandlerData child_read{OutputFormat::PANDAS};
+                    auto* child_state = PyInterpreterState_GetDict(PyInterpreterState_Get());
+                    auto* child_queue = PyDict_GetItemString(child_state, deferred_nans_key);
+                    isolated = child_queue && child_queue != main_queue;
+                    child_borrower = child_read.take_shared_data();
+                }
+                Py_EndInterpreter(subinterpreter);
+                PyThreadState_Swap(main_thread);
+                child_borrower.reset();
+
+                const bool main_queue_preserved = PyDict_GetItemString(main_state, deferred_nans_key) == main_queue;
+                std::_Exit(isolated && main_queue_preserved ? EXIT_SUCCESS : EXIT_FAILURE);
+            },
+            testing::ExitedWithCode(EXIT_SUCCESS),
+            ""
+    );
 }
